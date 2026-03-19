@@ -1,0 +1,26 @@
+mainmenu "EPS Single-Frame Test"
+
+	source "Kconfig.zephyr"
+
+menu "EPS single-frame options"
+
+	config CAN_LINK_NODE_ADDR
+		hex "Local CAN node address (8-bit)"
+		default 0x02
+		range 0x01 0xFE
+
+	config CAN_LINK_PEER_NODE_ADDR
+		hex "Peer CAN node address (8-bit)"
+		default 0x01
+		range 0x01 0xFE
+
+	config CAN_LINK_TX_PERIOD_MS
+		int "TX period in milliseconds"
+		default 1000
+		range 10 60000
+
+	config CAN_LINK_LOOPBACK
+		bool "Enable CAN loopback mode"
+		default n
+
+endmenu
