@@ -8,7 +8,7 @@ which keeps transport ownership inside Zephyr:
 
 - unicast RX uses `isotp_bind()` + `isotp_recv()`
 - TX uses asynchronous `isotp_send()`
-- ISO-TP extended addressing (`ext_addr`) is used together with distinct CAN IDs for data and FC traffic
+- ISO-TP fixed addressing is used together with distinct CAN IDs for data and FC traffic
 
 ## Goal
 
@@ -22,8 +22,8 @@ will have a long-lived unicast RX bind and will also start outbound ISO-TP sends
 
 ## Addressing Notes
 
-The current transport uses ISO-TP extended addressing with distinct CAN-ID
-bases plus separate `ext_addr` values for:
+The current transport uses ISO-TP fixed addressing with distinct CAN-ID
+bases for:
 
 - normal payload data
 - returned flow control

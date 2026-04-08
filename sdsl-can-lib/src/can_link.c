@@ -12,10 +12,9 @@
  * - one outbound transfer is allowed at a time
  *
  * Important limitation:
- * This file now uses ISO-TP extended addressing together with distinct CAN-ID
+ * This file now uses ISO-TP fixed addressing together with distinct CAN-ID
  * bases for data traffic versus flow-control traffic. Source and target node
- * IDs are carried in the low bytes of the 29-bit CAN identifier, while
- * ext_addr remains available as an additional transport selector.
+ * IDs are carried in the low bytes of the 29-bit CAN identifier.
  *
  * This gives the CAN filter layer a stronger routing key than the earlier
  * shared-CAN-ID approach.
@@ -25,7 +24,7 @@
  *
  * High-level flow:
  * 1. can_link_init()
- *    - configures extended-address CAN IDs
+ *    - configures fixed-address CAN IDs
  *    - starts the CAN controller
  *    - spawns long-lived RX workers that call isotp_bind() + isotp_recv()
  *
@@ -68,7 +67,7 @@ LOG_MODULE_REGISTER(can_link, LOG_LEVEL_INF);
 #define LIB_RX_TIMEOUT_MS 100
 #define LIB_DEFAULT_PRIO 7
 #define LIB_THREAD_PRIO 2
-#define LIB_SINGLE_FRAME_MAX_LEN 6U
+#define LIB_SINGLE_FRAME_MAX_LEN 7U
 
 /*
  * Use distinct 29-bit CAN-ID bases for:
@@ -82,7 +81,7 @@ LOG_MODULE_REGISTER(can_link, LOG_LEVEL_INF);
  *
  * 0x18CE0000 and 0x18CF0000 are intentionally adjacent so DATA and FC stay in
  * neighboring filter buckets while still being distinguishable at the CAN-ID
- * level before ISO-TP inspects ext_addr.
+ * level.
  *
  * 0x18DB0000 is kept separate for functional/broadcast traffic so broadcast
  * frames never collide with the point-to-point DATA/FC filters.
@@ -90,14 +89,7 @@ LOG_MODULE_REGISTER(can_link, LOG_LEVEL_INF);
 #define LIB_DATA_CAN_ID_BASE 0x18CE0000U
 #define LIB_FC_CAN_ID_BASE 0x18CF0000U
 #define LIB_FUNCTIONAL_CAN_ID_BASE 0x18DB0000U
-#define LIB_ISOTP_FLAGS_EXT (ISOTP_MSG_IDE | ISOTP_MSG_EXT_ADDR)
-/* Distinct extended-address bytes give Zephyr one more routing discriminator. */
-/* 0xA1 marks payload-bearing data traffic. */
-#define CAN_LINK_EXT_ADDR_DATA 0xA1U
-/* 0xA2 stays close to 0xA1 to show it is the paired FC channel for data. */
-#define CAN_LINK_EXT_ADDR_FC 0xA2U
-/* 0xB1 is intentionally in a different range so broadcast stands out in logs/debugging. */
-#define CAN_LINK_EXT_ADDR_BROADCAST 0xB1U
+#define LIB_ISOTP_FLAGS_FIXED (ISOTP_MSG_IDE | ISOTP_MSG_FIXED_ADDR)
 
 #ifndef CONFIG_CAN_LINK_NODE_ADDR
 #define CONFIG_CAN_LINK_NODE_ADDR 0x01
@@ -262,22 +254,20 @@ static uint8_t extract_source_node(const struct isotp_recv_ctx *ctx)
 }
 
 /*
- * Populate one Zephyr ISO-TP message identifier from routing components.
+ * Populate one Zephyr ISO-TP fixed-address message identifier from routing components.
  *
  * @param msg_id Output message-ID structure to populate.
  * @param base_id Fixed CAN-ID base that selects the traffic class.
  * @param target Destination node encoded into the CAN ID.
  * @param source Source node encoded into the CAN ID.
- * @param ext_addr Extended-address byte used as the secondary transport selector.
  */
-static void fill_isotp_ext_id(struct isotp_msg_id *msg_id, uint32_t base_id, uint8_t target,
-                  uint8_t source, uint8_t ext_addr)
+static void fill_isotp_fixed_id(struct isotp_msg_id *msg_id, uint32_t base_id, uint8_t target,
+                    uint8_t source)
 {
     /* Fill every field Zephyr needs so callers can build IDs from routing inputs alone. */
     *msg_id = (struct isotp_msg_id){
         .ext_id = build_can_id(base_id, target, source),
-        .ext_addr = ext_addr,
-        .flags = LIB_ISOTP_FLAGS_EXT,
+        .flags = LIB_ISOTP_FLAGS_FIXED,
     };
 }
 
@@ -299,26 +289,22 @@ static void configure_isotp_ids(struct isotp_ids *ids)
 
     /*
      * Use separate CAN-ID bases for DATA and FC so the CAN filter layer can
-     * distinguish them before Zephyr's ISO-TP handler inspects ext_addr.
+     * distinguish them directly.
      */
-    fill_isotp_ext_id(&ids->tx_addr, LIB_DATA_CAN_ID_BASE, peer, local,
-              CAN_LINK_EXT_ADDR_DATA);
-    fill_isotp_ext_id(&ids->rx_fc_addr, LIB_FC_CAN_ID_BASE, local, peer,
-              CAN_LINK_EXT_ADDR_FC);
+    fill_isotp_fixed_id(&ids->tx_addr, LIB_DATA_CAN_ID_BASE, peer, local);
+    fill_isotp_fixed_id(&ids->rx_fc_addr, LIB_FC_CAN_ID_BASE, local, peer);
 
     /* These are the long-lived receive-side bindings for peer-to-peer traffic. */
-    fill_isotp_ext_id(&ids->bind_rx_addr, LIB_DATA_CAN_ID_BASE, local, peer,
-              CAN_LINK_EXT_ADDR_DATA);
-    fill_isotp_ext_id(&ids->bind_tx_fc_addr, LIB_FC_CAN_ID_BASE, peer, local,
-              CAN_LINK_EXT_ADDR_FC);
+    fill_isotp_fixed_id(&ids->bind_rx_addr, LIB_DATA_CAN_ID_BASE, local, peer);
+    fill_isotp_fixed_id(&ids->bind_tx_fc_addr, LIB_FC_CAN_ID_BASE, peer, local);
 
     /* Broadcast uses the functional CAN-ID base and a shared broadcast target byte. */
-    fill_isotp_ext_id(&ids->broadcast_tx_addr, LIB_FUNCTIONAL_CAN_ID_BASE, BROADCAST_NODE,
-              local, CAN_LINK_EXT_ADDR_BROADCAST);
-    fill_isotp_ext_id(&ids->broadcast_bind_rx_addr, LIB_FUNCTIONAL_CAN_ID_BASE,
-              BROADCAST_NODE, 0U, CAN_LINK_EXT_ADDR_BROADCAST);
-    fill_isotp_ext_id(&ids->broadcast_bind_tx_addr, LIB_FUNCTIONAL_CAN_ID_BASE, 0U,
-              local, CAN_LINK_EXT_ADDR_FC);
+    fill_isotp_fixed_id(&ids->broadcast_tx_addr, LIB_FUNCTIONAL_CAN_ID_BASE, BROADCAST_NODE,
+                local);
+    fill_isotp_fixed_id(&ids->broadcast_bind_rx_addr, LIB_FUNCTIONAL_CAN_ID_BASE,
+                BROADCAST_NODE, 0U);
+    fill_isotp_fixed_id(&ids->broadcast_bind_tx_addr, LIB_FUNCTIONAL_CAN_ID_BASE, 0U,
+                local);
 }
 
 /*
@@ -460,22 +446,22 @@ static int start_async_send(uint8_t target_node, bool is_broadcast, const uint8_
     if (is_broadcast) {
         ARG_UNUSED(priority);
         /* Build a functional transmit ID aimed at every node on the bus. */
-        fill_isotp_ext_id(&tx_state.tx_addr, LIB_FUNCTIONAL_CAN_ID_BASE, BROADCAST_NODE,
-                  link_cfg.node_id, CAN_LINK_EXT_ADDR_BROADCAST);
+        fill_isotp_fixed_id(&tx_state.tx_addr, LIB_FUNCTIONAL_CAN_ID_BASE, BROADCAST_NODE,
+                    link_cfg.node_id);
         /*
          * Functional traffic does not use FC in normal practice, but Zephyr's
          * API still expects an RX identifier pointer.
          */
         /* Provide a placeholder FC route so the Zephyr API contract is satisfied. */
-        fill_isotp_ext_id(&tx_state.rx_fc_addr, LIB_FUNCTIONAL_CAN_ID_BASE, BROADCAST_NODE,
-                  link_cfg.node_id, CAN_LINK_EXT_ADDR_FC);
+        fill_isotp_fixed_id(&tx_state.rx_fc_addr, LIB_FUNCTIONAL_CAN_ID_BASE, BROADCAST_NODE,
+                    link_cfg.node_id);
     } else {
         ARG_UNUSED(priority);
         /* Point-to-point sends use the data base on TX and the FC base for replies. */
-        fill_isotp_ext_id(&tx_state.tx_addr, LIB_DATA_CAN_ID_BASE, target_node,
-                  link_cfg.node_id, CAN_LINK_EXT_ADDR_DATA);
-        fill_isotp_ext_id(&tx_state.rx_fc_addr, LIB_FC_CAN_ID_BASE, link_cfg.node_id,
-                  target_node, CAN_LINK_EXT_ADDR_FC);
+        fill_isotp_fixed_id(&tx_state.tx_addr, LIB_DATA_CAN_ID_BASE, target_node,
+                    link_cfg.node_id);
+        fill_isotp_fixed_id(&tx_state.rx_fc_addr, LIB_FC_CAN_ID_BASE, link_cfg.node_id,
+                    target_node);
     }
 
     /* Supplying a completion callback makes isotp_send() non-blocking. */

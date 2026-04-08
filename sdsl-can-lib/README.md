@@ -152,6 +152,8 @@ int main(void)
 - Current test applications also include generated protobuf headers such as
   `link.pb.h`. That works in this workspace, but the intended long-term public
   interface is `can_link.h`.
+- The current `can_link` architecture is documented in
+  [docs/can_link_design.md](C:/Users/wayne/Documents/SDSL/SquidSat/SDSL-CAN/sdsl-can-lib/docs/can_link_design.md).
 - This repository includes its own [west.yml](C:/Users/wayne/Documents/SDSL/SquidSat/SDSL-CAN/sdsl-can-lib/west.yml)
   for module development, but consuming projects do not need to use that file
   directly.

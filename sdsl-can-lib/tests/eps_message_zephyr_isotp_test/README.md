@@ -8,7 +8,7 @@ That implementation keeps transport ownership inside Zephyr:
 
 - unicast RX uses `isotp_bind()` + `isotp_recv()`
 - TX uses asynchronous `isotp_send()`
-- ISO-TP extended addressing (`ext_addr`) is used together with distinct CAN IDs for data and FC traffic
+- ISO-TP fixed addressing is used together with distinct CAN IDs for data and FC traffic
 - the public `can_link_*` API stays the same
 
 ## What It Verifies
@@ -29,15 +29,15 @@ The goal is to validate the updated structure first before attempting more rando
 
 ## Addressing Notes
 
-The current transport uses ISO-TP extended addressing together with separate
+The current transport uses ISO-TP fixed addressing together with separate
 CAN-ID routing for data and flow control:
 
-- normal payload traffic uses a DATA CAN-ID base plus a data `ext_addr`
-- returned flow-control traffic uses a different FC CAN-ID base plus an FC `ext_addr`
-- broadcast uses its own CAN-ID base and `ext_addr`
+- normal payload traffic uses a DATA CAN-ID base
+- returned flow-control traffic uses a different FC CAN-ID base
+- broadcast uses its own CAN-ID base
 
-Because extended addressing consumes one payload byte ahead of the PCI byte,
-the single-frame payload limit is reduced from `7` bytes to `6` bytes.
+Because fixed addressing keeps the address in the 29-bit CAN ID, the
+single-frame payload limit stays at `7` bytes on classical CAN.
 
 ## Files
 
@@ -89,4 +89,4 @@ Receiver board (`node_b.conf`):
 
 - application logging now says `TX started` because `can_link_send_to()` starts an async ISO-TP transfer and returns immediately
 - completion is logged from [can_link.c](/C:/Users/wayne/Documents/SDSL/SquidSat/SDSL-CAN/sdsl-can-lib/src/can_link.c)
-- this test is meant to validate the updated Zephyr-centric extended-address transport structure with distinct CAN-ID routing, not the earlier raw session-manager prototype
+- this test is meant to validate the updated Zephyr-centric fixed-address transport structure with distinct CAN-ID routing, not the earlier raw session-manager prototype
