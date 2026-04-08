@@ -1,6 +1,52 @@
+/*
+ * can_link.c
+ *
+ * Zephyr-native ISO-TP wrapper that keeps transport ownership inside Zephyr's
+ * isotp_bind()/isotp_recv()/isotp_send() state machines.
+ *
+ * This variant is intentionally simpler than the raw-frame session-manager
+ * prototype:
+ * - unicast RX is handled by a long-lived bound receive context
+ * - broadcast RX is handled by a long-lived bound receive context
+ * - outbound sends use asynchronous isotp_send() with a completion callback
+ * - one outbound transfer is allowed at a time
+ *
+ * Important limitation:
+ * This file now uses ISO-TP fixed addressing together with distinct CAN-ID
+ * bases for data traffic versus flow-control traffic. Source and target node
+ * IDs are carried in the low bytes of the 29-bit CAN identifier.
+ *
+ * This gives the CAN filter layer a stronger routing key than the earlier
+ * shared-CAN-ID approach.
+ *
+ * This implementation is therefore a cleaner Zephyr-centric baseline, not a
+ * complete solution for arbitrary overlapping duplex sessions with one peer.
+ *
+ * High-level flow:
+ * 1. can_link_init()
+ *    - configures fixed-address CAN IDs
+ *    - starts the CAN controller
+ *    - spawns long-lived RX workers that call isotp_bind() + isotp_recv()
+ *
+ * 2. can_link_send_to() / can_link_send_broadcast()
+ *    - copy the caller payload into a persistent internal TX buffer
+ *    - build per-send TX and FC CAN identifiers
+ *    - start asynchronous isotp_send()
+ *
+ * 3. Zephyr ISO-TP internals
+ *    - segment multi-frame payloads
+ *    - wait for returned FC frames
+ *    - reassemble inbound payloads for bound RX contexts
+ *
+ * 4. Completion paths
+ *    - RX workers deliver complete payloads to rx_callback
+ *    - tx_complete_cb() marks the async send as finished and logs the result
+ */
+
 #include "can_link.h"
 
 #include <errno.h>
+#include <string.h>
 #include <zephyr/canbus/isotp.h>
 #include <zephyr/device.h>
 #include <zephyr/drivers/can.h>
@@ -12,19 +58,38 @@
 
 LOG_MODULE_REGISTER(can_link, LOG_LEVEL_INF);
 
-/* ISO 15765-2 (ISO-TP) Fixed Addressing Protocol Formats */
-#define FIXED_TATYPE_PHYSICAL 0xDAU /* Peer-to-peer: Used for 1-to-1 communication (supports multi-frame) */
-#define FIXED_TATYPE_FUNCTIONAL 0xDBU /* Functional: Used for 1-to-many/broadcast (single-frame only) */
+#define BROADCAST_NODE 0xFFU
 
-/* SAE J1939 / ISO-TP Global Addressing */
-#define BROADCAST_NODE 0xFFU /* Global Target Address (all nodes on the bus) */
+/* Internal defaults */
+#define LIB_RX_BUFFER_SIZE 256
+#define LIB_TX_BUFFER_SIZE 256
+#define LIB_THREAD_STACK 2048
+#define LIB_RX_TIMEOUT_MS 100
+#define LIB_DEFAULT_PRIO 7
+#define LIB_THREAD_PRIO 2
+#define LIB_SINGLE_FRAME_MAX_LEN 7U
 
-/* Internal Library Defaults (Replacing Kconfig dependencies) */
-#define LIB_RX_BUFFER_SIZE  256
-#define LIB_THREAD_STACK    2048
-#define LIB_RX_TIMEOUT_MS   100
-#define LIB_DEFAULT_PRIO    7
-#define LIB_THREAD_PRIO     2
+/*
+ * Use distinct 29-bit CAN-ID bases for:
+ * - point-to-point data traffic
+ * - point-to-point flow-control traffic
+ * - functional/broadcast traffic
+ *
+ * The low two bytes still carry target/source node IDs, so each base keeps
+ * its low 16 bits clear. That lets build_can_id() drop the target into bits
+ * 15:8 and the source into bits 7:0 without overwriting the traffic class.
+ *
+ * 0x18CE0000 and 0x18CF0000 are intentionally adjacent so DATA and FC stay in
+ * neighboring filter buckets while still being distinguishable at the CAN-ID
+ * level.
+ *
+ * 0x18DB0000 is kept separate for functional/broadcast traffic so broadcast
+ * frames never collide with the point-to-point DATA/FC filters.
+ */
+#define LIB_DATA_CAN_ID_BASE 0x18CE0000U
+#define LIB_FC_CAN_ID_BASE 0x18CF0000U
+#define LIB_FUNCTIONAL_CAN_ID_BASE 0x18DB0000U
+#define LIB_ISOTP_FLAGS_FIXED (ISOTP_MSG_IDE | ISOTP_MSG_FIXED_ADDR)
 
 #ifndef CONFIG_CAN_LINK_NODE_ADDR
 #define CONFIG_CAN_LINK_NODE_ADDR 0x01
@@ -52,130 +117,89 @@ LOG_MODULE_REGISTER(can_link, LOG_LEVEL_INF);
 #define CAN_LINK_BROADCAST_RX_ENABLED true
 #endif
 
-/**
- * @brief Internal Link Configuration
- * This structure holds values that were previously sourced from Kconfig.
- */
 static struct {
+    /* Local node address inserted into outbound CAN IDs. */
     uint8_t node_id;
+    /* Default peer used by can_link_send(). */
     uint8_t peer_id;
+    /* When true, send traffic back through the local controller. */
     bool loopback;
 } link_cfg = {
     .node_id = (uint8_t)CONFIG_CAN_LINK_NODE_ADDR,
     .peer_id = (uint8_t)CONFIG_CAN_LINK_PEER_NODE_ADDR,
-    .loopback = CAN_LINK_LOOPBACK_ENABLED
+    .loopback = CAN_LINK_LOOPBACK_ENABLED,
 };
 
-/**
- * @brief ISO-TP Addressing Configuration
- * * This structure manages the CAN identifiers required for full-duplex 
- * ISO-TP (ISO 15765-2) communication, covering both point-to-point 
- * (Unicast) and one-to-many (Broadcast) interactions.
- */
+/* Precomputed ISO-TP address sets for unicast and broadcast directions. */
 struct isotp_ids {
-    /* --- Unicast Transmission (Outgoing Request/Data) --- */
-    struct isotp_msg_id tx_addr;             /* ID used to send data/requests to a specific peer */
-    struct isotp_msg_id rx_fc_addr;          /* ID used to receive Flow Control frames from that peer */
-
-    /* --- Unicast Reception (Incoming Request/Data) --- */
-    struct isotp_msg_id bind_rx_addr;        /* ID this node listens to for incoming peer data */
-    struct isotp_msg_id bind_tx_fc_addr;     /* ID used to send Flow Control back to the sender */
-
-    /* --- Broadcast / Functional Addressing --- */
-    struct isotp_msg_id broadcast_tx_addr;        /* ID used to send a functional request to all nodes */
-    struct isotp_msg_id broadcast_bind_rx_addr;   /* ID used to listen for global/functional requests */
-    struct isotp_msg_id broadcast_bind_tx_addr;   /* ID used for responding to functional requests */
+    /* Outbound data path for point-to-point sends. */
+    struct isotp_msg_id tx_addr;
+    /* Flow-control frames expected back from the peer for unicast sends. */
+    struct isotp_msg_id rx_fc_addr;
+    /* RX binding used to accept inbound point-to-point data. */
+    struct isotp_msg_id bind_rx_addr;
+    /* FC address Zephyr transmits from when servicing the unicast RX bind. */
+    struct isotp_msg_id bind_tx_fc_addr;
+    /* Outbound functional/broadcast transmit identifier. */
+    struct isotp_msg_id broadcast_tx_addr;
+    /* RX binding used to accept inbound functional broadcast frames. */
+    struct isotp_msg_id broadcast_bind_rx_addr;
+    /* Companion transmit ID used by the broadcast RX binding. */
+    struct isotp_msg_id broadcast_bind_tx_addr;
 };
 
-/**
- * @brief ISO-TP Receive Worker Configuration
- * * This structure bundles the context and addressing required for a background 
- * thread to manage an ISO-TP reception stream. It allows the same thread 
- * entry function to handle both Unicast and Broadcast traffic.
- */
+/* Parameters passed into each long-lived RX worker thread. */
 struct rx_worker {
-    /** Internal state machine context for the ISO-TP stack. */
+    /* Zephyr receive context owned by this worker. */
     struct isotp_recv_ctx *ctx;
-
-    /** The CAN ID filter this worker listens for (The "Inbox"). */
+    /* CAN/ISO-TP route this worker binds to for incoming traffic. */
     const struct isotp_msg_id *rx_addr;
-
-    /** The CAN ID used to send Flow Control frames back to the sender. */
+    /* Address Zephyr uses when this worker needs to emit flow-control frames. */
     const struct isotp_msg_id *tx_addr;
-
-    /** Flag indicating if this worker handles functional (one-to-many) requests. */
+    /* Tags callbacks/logging so the worker knows which path it serves. */
     bool is_broadcast;
 };
 
-/* --- Thread Resource Definitions --- */
+/* Shared state for the single async outbound transfer slot. */
+struct async_tx_state {
+    /* Serializes access to the single in-flight send state. */
+    struct k_mutex lock;
+    /* Zephyr send context that tracks ISO-TP transmit progress. */
+    struct isotp_send_ctx ctx;
+    /* Backing storage must outlive async isotp_send() completion. */
+    uint8_t buffer[LIB_TX_BUFFER_SIZE];
+    /* Per-send transmit identifier built just before launching isotp_send(). */
+    struct isotp_msg_id tx_addr;
+    /* Per-send flow-control receive identifier paired with tx_addr. */
+    struct isotp_msg_id rx_fc_addr;
+    /* Indicates whether the single outbound slot is currently occupied. */
+    bool in_flight;
+    /* Remembers whether the current send is functional broadcast traffic. */
+    bool is_broadcast;
+    /* Captures the logical target for logging and completion reporting. */
+    uint8_t target_node;
+};
 
-/** * Reserved memory areas for the execution stacks of the RX threads. 
- * The size is determined by 'LIB_THREAD_STACK'.
- */
 K_THREAD_STACK_DEFINE(unicast_rx_thread_stack, LIB_THREAD_STACK);
 K_THREAD_STACK_DEFINE(broadcast_rx_thread_stack, LIB_THREAD_STACK);
 
-/** * Kernel thread objects (TCBs). These structures hold the metadata 
- * (priority, state, etc.) for the Unicast and Broadcast receiver threads. 
- */
 static struct k_thread unicast_rx_thread_data;
 static struct k_thread broadcast_rx_thread_data;
 
-/** * Mutual exclusion lock used to serialize access to the ISO-TP send contexts.
- * This prevents multiple threads from attempting to send CAN messages simultaneously.
- */
-K_MUTEX_DEFINE(send_lock);
-
-/* --- ISO-TP Stack State & Contexts --- */
-
-/** * Central registry of CAN identifiers (TX, RX, and Flow Control) for 
- * both point-to-point and functional addressing.
- */
 static struct isotp_ids link_addr_cfg;
-
-/** * State machine for outgoing unicast (point-to-point) transfers.
- * Manages segment tracking and Flow Control timing for the primary link.
- */
-static struct isotp_send_ctx send_ctx;
-
-/** * State machine for outgoing broadcast (functional) transfers.
- * ISO-TP broadcasts are typically limited to Single Frames (SF).
- */
-static struct isotp_send_ctx broadcast_send_ctx;
-
-/** * State machine for incoming unicast transfers.
- * Tracks fragments and reassembly for data addressed specifically to this node.
- */
 static struct isotp_recv_ctx recv_ctx;
-
-/** * State machine for incoming broadcast transfers.
- * Monitors the functional address (e.g., 0x7DF) for global commands.
- */
 static struct isotp_recv_ctx broadcast_recv_ctx;
+static struct async_tx_state tx_state;
 
-/** * ISO-TP Flow Control Options:
- * .bs (Block Size) = 0: The sender can send all remaining frames without 
- * waiting for another Flow Control frame.
- * .stmin (Separation Time) = 0: No minimum delay required between consecutive 
- * CAN frames (max speed).
- */
 static const struct isotp_fc_opts fc_opts = {
     .bs = 0,
     .stmin = 0,
 };
 
-/** Pointer to the CAN hardware device defined in the Zephyr DeviceTree (zephyr,canbus). */
 static const struct device *const can_dev = DEVICE_DT_GET(DT_CHOSEN(zephyr_canbus));
 
-/* --- Application Callbacks & State --- */
-
-/** Application-defined function called when a complete ISO-TP message is received. */
 static can_link_rx_handler_t rx_callback;
-
-/** User-provided pointer passed back to the rx_callback (useful for context/objects). */
 static void *rx_callback_user_data;
-
-/** Flag to prevent multiple initializations of the can_link module. */
 static bool is_initialized;
 
 static struct rx_worker unicast_worker = {
@@ -192,118 +216,169 @@ static struct rx_worker broadcast_worker = {
     .is_broadcast = true,
 };
 
+/*
+ * Return the local node ID currently configured for this link instance.
+ */
 uint32_t can_link_node_id(void)
 {
+    /* Expose the locally configured node ID without leaking internal config state. */
     return (uint32_t)link_cfg.node_id;
 }
 
-static uint32_t build_fixed_addr_id(uint8_t priority, uint8_t ta_type, uint8_t target, uint8_t source)
+/*
+ * Build one extended CAN identifier from a traffic-class base plus node IDs.
+ *
+ * @param base_id Fixed high bits that identify the traffic class.
+ * @param target Destination node encoded into bits 15:8.
+ * @param source Source node encoded into bits 7:0.
+ *
+ * @return Fully packed 29-bit CAN identifier.
+ */
+static uint32_t build_can_id(uint32_t base_id, uint8_t target, uint8_t source)
 {
-    uint32_t id = 0U;
-
-    id |= (((uint32_t)priority << ISOTP_FIXED_ADDR_PRIO_POS) & ISOTP_FIXED_ADDR_PRIO_MASK);
-    id |= (((uint32_t)target << ISOTP_FIXED_ADDR_TA_POS) & ISOTP_FIXED_ADDR_TA_MASK);
-    id |= (((uint32_t)source << ISOTP_FIXED_ADDR_SA_POS) & ISOTP_FIXED_ADDR_SA_MASK);
-    id |= ((uint32_t)ta_type << 16);
-
-    return id;
+    /* Pack the routing tuple into the 29-bit extended CAN ID. */
+    return base_id | ((uint32_t)target << 8) | (uint32_t)source;
 }
 
+/*
+ * Recover the source node ID from the receive context's matched CAN ID.
+ *
+ * @param ctx Receive context that holds the bound RX address.
+ *
+ * @return Source node carried in the low byte of the extended CAN ID.
+ */
 static uint8_t extract_source_node(const struct isotp_recv_ctx *ctx)
 {
-    return (uint8_t)((ctx->rx_addr.ext_id & ISOTP_FIXED_ADDR_SA_MASK) >> ISOTP_FIXED_ADDR_SA_POS);
+    /* RX contexts keep the matched CAN ID, so the source node lives in the low byte. */
+    return (uint8_t)(ctx->rx_addr.ext_id & 0xFFU);
 }
 
-static void fill_isotp_fixed_id(struct isotp_msg_id *msg_id, uint8_t priority, uint8_t ta_type,
-                   uint8_t target, uint8_t source)
+/*
+ * Populate one Zephyr ISO-TP fixed-address message identifier from routing components.
+ *
+ * @param msg_id Output message-ID structure to populate.
+ * @param base_id Fixed CAN-ID base that selects the traffic class.
+ * @param target Destination node encoded into the CAN ID.
+ * @param source Source node encoded into the CAN ID.
+ */
+static void fill_isotp_fixed_id(struct isotp_msg_id *msg_id, uint32_t base_id, uint8_t target,
+                    uint8_t source)
 {
+    /* Fill every field Zephyr needs so callers can build IDs from routing inputs alone. */
     *msg_id = (struct isotp_msg_id){
-        .ext_id = build_fixed_addr_id(priority, ta_type, target, source),
-        .flags = ISOTP_MSG_FIXED_ADDR | ISOTP_MSG_IDE,
+        .ext_id = build_can_id(base_id, target, source),
+        .flags = LIB_ISOTP_FLAGS_FIXED,
     };
 }
 
+/*
+ * Precompute the complete set of ISO-TP identifiers used by this node.
+ *
+ * This builds the long-lived unicast and broadcast routes once during init so
+ * the RX workers and send paths can reuse a consistent address map derived
+ * from the local node ID, configured peer ID, and loopback mode.
+ *
+ * @param ids Output structure that receives the fully populated ISO-TP
+ *            identifiers for unicast TX/RX, flow-control routing, and
+ *            broadcast traffic.
+ */
 static void configure_isotp_ids(struct isotp_ids *ids)
 {
     const uint8_t local = link_cfg.node_id;
     const uint8_t peer = link_cfg.loopback ? local : link_cfg.peer_id;
 
-    /* Unicast: local -> peer data, peer -> local flow-control. */
-    fill_isotp_fixed_id(&ids->tx_addr, LIB_DEFAULT_PRIO,
-                FIXED_TATYPE_PHYSICAL, peer, local);
-    fill_isotp_fixed_id(&ids->rx_fc_addr, 0,
-                FIXED_TATYPE_PHYSICAL, local, peer);
+    /*
+     * Use separate CAN-ID bases for DATA and FC so the CAN filter layer can
+     * distinguish them directly.
+     */
+    fill_isotp_fixed_id(&ids->tx_addr, LIB_DATA_CAN_ID_BASE, peer, local);
+    fill_isotp_fixed_id(&ids->rx_fc_addr, LIB_FC_CAN_ID_BASE, local, peer);
 
-    /* Unicast receive: match the actual expected sender for this link. */
-    fill_isotp_fixed_id(&ids->bind_rx_addr, 0,
-                FIXED_TATYPE_PHYSICAL, local, peer);
-    fill_isotp_fixed_id(&ids->bind_tx_fc_addr, 0,
-                FIXED_TATYPE_PHYSICAL, peer, local);
+    /* These are the long-lived receive-side bindings for peer-to-peer traffic. */
+    fill_isotp_fixed_id(&ids->bind_rx_addr, LIB_DATA_CAN_ID_BASE, local, peer);
+    fill_isotp_fixed_id(&ids->bind_tx_fc_addr, LIB_FC_CAN_ID_BASE, peer, local);
 
-    /* Broadcast (functional): sender targets 0xFF. */
-    fill_isotp_fixed_id(&ids->broadcast_tx_addr, 0,
-                FIXED_TATYPE_FUNCTIONAL, BROADCAST_NODE, local);
-    fill_isotp_fixed_id(&ids->broadcast_bind_rx_addr, 0,
-                FIXED_TATYPE_FUNCTIONAL, BROADCAST_NODE, 0U);
-    fill_isotp_fixed_id(&ids->broadcast_bind_tx_addr, 0,
-                FIXED_TATYPE_FUNCTIONAL, 0U, local);
+    /* Broadcast uses the functional CAN-ID base and a shared broadcast target byte. */
+    fill_isotp_fixed_id(&ids->broadcast_tx_addr, LIB_FUNCTIONAL_CAN_ID_BASE, BROADCAST_NODE,
+                local);
+    fill_isotp_fixed_id(&ids->broadcast_bind_rx_addr, LIB_FUNCTIONAL_CAN_ID_BASE,
+                BROADCAST_NODE, 0U);
+    fill_isotp_fixed_id(&ids->broadcast_bind_tx_addr, LIB_FUNCTIONAL_CAN_ID_BASE, 0U,
+                local);
 }
 
-/**
- * @brief Background thread for processing incoming ISO-TP messages.
- * * This thread binds a specific ISO-TP context to a CAN ID pair and enters
- * a continuous loop waiting for complete reassembled data packets.
+/*
+ * Completion callback invoked by Zephyr when an async ISO-TP send finishes.
+ *
+ * @param error_nr Zephyr ISO-TP completion status.
+ * @param arg Caller-supplied pointer to the shared async TX state.
+ */
+static void tx_complete_cb(int error_nr, void *arg)
+{
+    struct async_tx_state *state = arg;
+
+    /* The callback runs after Zephyr's internal ISO-TP state machine finishes. */
+    k_mutex_lock(&state->lock, K_FOREVER);
+    /* Re-open the single in-flight slot before any waiting caller tries again. */
+    state->in_flight = false;
+    k_mutex_unlock(&state->lock);
+
+    if (error_nr == ISOTP_N_OK) {
+        LOG_INF("ISO-TP TX complete target=%u broadcast=%d",
+            (unsigned int)state->target_node, state->is_broadcast);
+    } else {
+        LOG_ERR("ISO-TP TX failed target=%u broadcast=%d err=%d",
+            (unsigned int)state->target_node, state->is_broadcast, error_nr);
+    }
+}
+
+/*
+ * Long-lived worker thread that binds one RX route and drains completed payloads.
+ *
+ * @param arg1 Pointer to the worker configuration for this RX path.
+ * @param arg2 Unused Zephyr thread argument.
+ * @param arg3 Unused Zephyr thread argument.
  */
 static void rx_thread(void *arg1, void *arg2, void *arg3)
 {
     uint8_t rx_buffer[LIB_RX_BUFFER_SIZE];
-    /* Cast the generic thread argument back to our worker configuration */
-    struct rx_worker *worker = (struct rx_worker *)arg1;
+    struct rx_worker *worker = arg1;
     int ret;
 
-    /* Zephyr thread entry boilerplate for unused arguments */
     ARG_UNUSED(arg2);
     ARG_UNUSED(arg3);
 
-    /**
-     * Bind the ISO-TP receive context to the CAN device and specific addresses.
-     * This tells the ISO-TP stack to start managing the state machine for 
-     * messages arriving on 'rx_addr' and sending flow control on 'tx_addr'.
+    /*
+     * Zephyr owns inbound reassembly and FC generation once this bind
+     * succeeds. The worker simply drains complete payloads with isotp_recv().
      */
-    ret = isotp_bind(worker->ctx, can_dev, worker->rx_addr, worker->tx_addr, &fc_opts, K_FOREVER);
+    ret = isotp_bind(worker->ctx, can_dev, worker->rx_addr, worker->tx_addr,
+             &fc_opts, K_FOREVER);
     if (ret != ISOTP_N_OK) {
         LOG_ERR("ISO-TP bind failed (broadcast=%d): %d", worker->is_broadcast, ret);
         return;
     }
 
-    LOG_INF("ISO-TP RX ready id=0x%08x broadcast=%d", worker->rx_addr->ext_id,
-        worker->is_broadcast);
+    LOG_INF("ISO-TP RX ready id=0x%08x broadcast=%d",
+        worker->rx_addr->ext_id, worker->is_broadcast);
 
-    /* Main receive loop */
     while (1) {
-        /**
-         * Wait for an incoming message. This call blocks the thread until 
-         * a complete ISO-TP message (potentially multi-frame) is reassembled 
-         * or a timeout occurs.
-         */
+        /* Poll for a fully reassembled ISO-TP payload from this bound route. */
         int rx_len = isotp_recv(worker->ctx, rx_buffer, sizeof(rx_buffer),
                     K_MSEC(LIB_RX_TIMEOUT_MS));
 
-        /* Handled timeout cases - loop back and wait again */
+        /* Timeouts are normal here because the worker stays alive forever. */
         if (rx_len == ISOTP_RECV_TIMEOUT) {
             continue;
         }
-
-        /* Handle protocol errors (e.g., buffer overflow, fragmentation errors) */
+        /* Negative values mean Zephyr aborted or rejected the receive attempt. */
         if (rx_len < 0) {
-            LOG_ERR("ISO-TP receive failed (broadcast=%d): %d", worker->is_broadcast, rx_len);
+            LOG_ERR("ISO-TP receive failed (broadcast=%d): %d",
+                worker->is_broadcast, rx_len);
             continue;
         }
 
-        /**
-         * Message successfully reassembled. 
-         * Trigger the application callback to process the data payload.
-         */
+        /* Hand the completed payload to the application with the decoded source node. */
         if (rx_callback != NULL) {
             rx_callback(rx_buffer, (size_t)rx_len, extract_source_node(worker->ctx),
                     worker->is_broadcast, rx_callback_user_data);
@@ -311,6 +386,104 @@ static void rx_thread(void *arg1, void *arg2, void *arg3)
     }
 }
 
+/*
+ * Decode the protobuf payload just far enough to recover the requested priority.
+ *
+ * @param payload Serialized LinkMessage bytes.
+ * @param len Payload length in bytes.
+ *
+ * @return CAN priority in the range 0..7, or the library default on decode failure.
+ */
+static uint8_t get_priority_from_pb(const uint8_t *payload, size_t len)
+{
+    LinkMessage msg = LinkMessage_init_zero;
+    pb_istream_t stream = pb_istream_from_buffer(payload, len);
+
+    /* If decode fails, keep using the library's fixed default priority policy. */
+    if (!pb_decode(&stream, LinkMessage_fields, &msg)) {
+        return (uint8_t)LIB_DEFAULT_PRIO;
+    }
+
+    /* Clamp to the 3-bit range used by CAN priorities. */
+    return (msg.priority > 7U) ? 7U : (uint8_t)msg.priority;
+}
+
+/*
+ * Launch one asynchronous unicast or broadcast ISO-TP transfer.
+ *
+ * @param target_node Logical destination node, or BROADCAST_NODE for functional traffic.
+ * @param is_broadcast True when the send should use the broadcast route.
+ * @param payload Caller-provided serialized bytes to transmit.
+ * @param len Payload length in bytes.
+ *
+ * @return 0 on successful start, or a negative error if the transfer could not be queued.
+ */
+static int start_async_send(uint8_t target_node, bool is_broadcast, const uint8_t *payload, size_t len)
+{
+    uint8_t priority;
+    int ret;
+
+    if (len > sizeof(tx_state.buffer)) {
+        return -EMSGSIZE;
+    }
+
+    /* Inspect the payload now so policy decisions happen before the transfer starts. */
+    priority = get_priority_from_pb(payload, len);
+
+    /* Keep the current policy simple: only one outbound transfer at a time. */
+    k_mutex_lock(&tx_state.lock, K_FOREVER);
+    if (tx_state.in_flight) {
+        k_mutex_unlock(&tx_state.lock);
+        return -EBUSY;
+    }
+
+    /* Copy caller-owned data into persistent storage that survives async completion. */
+    memcpy(tx_state.buffer, payload, len);
+    tx_state.in_flight = true;
+    tx_state.target_node = target_node;
+    tx_state.is_broadcast = is_broadcast;
+
+    if (is_broadcast) {
+        ARG_UNUSED(priority);
+        /* Build a functional transmit ID aimed at every node on the bus. */
+        fill_isotp_fixed_id(&tx_state.tx_addr, LIB_FUNCTIONAL_CAN_ID_BASE, BROADCAST_NODE,
+                    link_cfg.node_id);
+        /*
+         * Functional traffic does not use FC in normal practice, but Zephyr's
+         * API still expects an RX identifier pointer.
+         */
+        /* Provide a placeholder FC route so the Zephyr API contract is satisfied. */
+        fill_isotp_fixed_id(&tx_state.rx_fc_addr, LIB_FUNCTIONAL_CAN_ID_BASE, BROADCAST_NODE,
+                    link_cfg.node_id);
+    } else {
+        ARG_UNUSED(priority);
+        /* Point-to-point sends use the data base on TX and the FC base for replies. */
+        fill_isotp_fixed_id(&tx_state.tx_addr, LIB_DATA_CAN_ID_BASE, target_node,
+                    link_cfg.node_id);
+        fill_isotp_fixed_id(&tx_state.rx_fc_addr, LIB_FC_CAN_ID_BASE, link_cfg.node_id,
+                    target_node);
+    }
+
+    /* Supplying a completion callback makes isotp_send() non-blocking. */
+    ret = isotp_send(&tx_state.ctx, can_dev, tx_state.buffer, len, &tx_state.tx_addr,
+             &tx_state.rx_fc_addr, tx_complete_cb, &tx_state);
+    if (ret != ISOTP_N_OK) {
+        /* Undo the in-flight marker immediately when Zephyr rejects the send setup. */
+        tx_state.in_flight = false;
+    }
+    k_mutex_unlock(&tx_state.lock);
+
+    return ret;
+}
+
+/*
+ * Initialize the CAN controller, transport address map, and background RX workers.
+ *
+ * @param rx_handler Application callback invoked for completed inbound payloads.
+ * @param user_data Opaque pointer passed back to rx_handler.
+ *
+ * @return 0 on success, or a negative error if initialization fails.
+ */
 int can_link_init(can_link_rx_handler_t rx_handler, void *user_data)
 {
     k_tid_t rx_tid;
@@ -326,7 +499,12 @@ int can_link_init(can_link_rx_handler_t rx_handler, void *user_data)
         return -ENODEV;
     }
 
+    /* Precompute the long-lived ISO-TP address set once from the active link config. */
     configure_isotp_ids(&link_addr_cfg);
+    /* Protect the shared async TX state before any send attempts can happen. */
+    k_mutex_init(&tx_state.lock);
+
+    /* Select normal bus participation or local loopback based on build-time config. */
     mode = link_cfg.loopback ? CAN_MODE_LOOPBACK : CAN_MODE_NORMAL;
 
     ret = can_set_mode(can_dev, mode);
@@ -344,15 +522,15 @@ int can_link_init(can_link_rx_handler_t rx_handler, void *user_data)
     rx_callback = rx_handler;
     rx_callback_user_data = user_data;
 
-    LOG_INF("CAN start node=%u peer=%u loopback=%d", 
+    LOG_INF("CAN start node=%u peer=%u loopback=%d",
         (unsigned int)link_cfg.node_id, (unsigned int)link_cfg.peer_id,
         link_cfg.loopback);
 
     if (CAN_LINK_UNICAST_RX_ENABLED) {
+        /* Spawn the worker that binds the peer-to-peer RX route and drains packets forever. */
         rx_tid = k_thread_create(&unicast_rx_thread_data, unicast_rx_thread_stack,
                      K_THREAD_STACK_SIZEOF(unicast_rx_thread_stack), rx_thread,
-                     &unicast_worker, NULL, NULL, LIB_THREAD_PRIO, 0,
-                     K_NO_WAIT);
+                     &unicast_worker, NULL, NULL, LIB_THREAD_PRIO, 0, K_NO_WAIT);
         if (rx_tid == NULL) {
             LOG_ERR("Failed to create unicast RX thread");
             return -EIO;
@@ -363,10 +541,10 @@ int can_link_init(can_link_rx_handler_t rx_handler, void *user_data)
     }
 
     if (CAN_LINK_BROADCAST_RX_ENABLED) {
+        /* Keep broadcast reception separate so functional traffic has its own bind/filter path. */
         rx_tid = k_thread_create(&broadcast_rx_thread_data, broadcast_rx_thread_stack,
                      K_THREAD_STACK_SIZEOF(broadcast_rx_thread_stack), rx_thread,
-                     &broadcast_worker, NULL, NULL,
-                     LIB_THREAD_PRIO, 0, K_NO_WAIT);
+                     &broadcast_worker, NULL, NULL, LIB_THREAD_PRIO, 0, K_NO_WAIT);
         if (rx_tid == NULL) {
             LOG_ERR("Failed to create broadcast RX thread");
             return -EIO;
@@ -377,44 +555,37 @@ int can_link_init(can_link_rx_handler_t rx_handler, void *user_data)
     }
 
     is_initialized = true;
-
     return 0;
 }
 
-/**
- * @brief Helper to extract the priority field from an encoded LinkMessage buffer.
- * * Uses Nanopb to decode only the necessary header fields.
+/*
+ * Send a payload to the configured default peer node.
+ *
+ * @param payload Serialized bytes to transmit.
+ * @param len Payload length in bytes.
+ *
+ * @return Result from can_link_send_to().
  */
-static uint8_t get_priority_from_pb(const uint8_t *payload, size_t len)
-{
-    LinkMessage msg = LinkMessage_init_zero;
-    pb_istream_t stream = pb_istream_from_buffer(payload, len);
-
-    /* We decode the whole message to get the priority. 
-     * Clamped to 7 (lowest) if decoding fails or value is out of range. */
-    if (!pb_decode(&stream, LinkMessage_fields, &msg)) {
-        return (uint8_t)LIB_DEFAULT_PRIO; 
-    }
-
-    return (msg.priority > 7U) ? 7U : (uint8_t)msg.priority;
-}
-
 int can_link_send(const uint8_t *payload, size_t len)
 {
     return can_link_send_to(link_cfg.peer_id, payload, len);
 }
 
+/*
+ * Start an asynchronous point-to-point ISO-TP transfer to one target node.
+ *
+ * @param target_node Destination node ID.
+ * @param payload Serialized bytes to transmit.
+ * @param len Payload length in bytes.
+ *
+ * @return 0 on successful start, or a negative error if validation or queueing fails.
+ */
 int can_link_send_to(uint8_t target_node, const uint8_t *payload, size_t len)
 {
-    int ret;
-    struct isotp_msg_id tx_addr;
-    struct isotp_msg_id rx_fc_addr;
-    const uint8_t local = link_cfg.node_id;
-
     if (!is_initialized) {
+        /* Refuse sends until the CAN device, worker threads, and address map are ready. */
         return -EACCES;
     }
-
     if ((payload == NULL) || (len == 0U)) {
         return -EINVAL;
     }
@@ -422,55 +593,30 @@ int can_link_send_to(uint8_t target_node, const uint8_t *payload, size_t len)
         return -EINVAL;
     }
 
-    /* Extract priority directly from the encoded Protobuf tx_buffer */
-    uint8_t priority = get_priority_from_pb(payload, len);
-
-    /**
-     * Use the extracted priority for the data transmission.
-     * High importance messages (prio 0-2) will win CAN arbitration.
-     */
-    fill_isotp_fixed_id(&tx_addr, priority, FIXED_TATYPE_PHYSICAL,
-                        target_node, local);
-    /* Keep Flow Control at a consistent high priority to prevent timeouts */
-    fill_isotp_fixed_id(&rx_fc_addr, 0, FIXED_TATYPE_PHYSICAL,
-                        local, target_node);
-
-    k_mutex_lock(&send_lock, K_FOREVER);
-    ret = isotp_send(&send_ctx, can_dev, payload, len, &tx_addr, &rx_fc_addr, NULL, NULL);
-    k_mutex_unlock(&send_lock);
-
-    return ret;
+    /* Returns after the send is started; final status arrives via tx_complete_cb(). */
+    return start_async_send(target_node, false, payload, len);
 }
 
+/*
+ * Start an asynchronous functional broadcast send on the single-frame path.
+ *
+ * @param payload Serialized bytes to transmit.
+ * @param len Payload length in bytes.
+ *
+ * @return 0 on successful start, or a negative error if validation or queueing fails.
+ */
 int can_link_send_broadcast(const uint8_t *payload, size_t len)
 {
-    int ret;
-    struct isotp_msg_id tx_addr;
-    const uint8_t local = link_cfg.node_id;
-
     if (!is_initialized) {
         return -EACCES;
     }
-
     if ((payload == NULL) || (len == 0U)) {
         return -EINVAL;
     }
-
-    /* Classical CAN single-frame ISO-TP payload limit without ext addressing. */
-    if (len > 7U) {
+    if (len > LIB_SINGLE_FRAME_MAX_LEN) {
+        /* Functional broadcast is intentionally limited to one CAN frame. */
         return -EMSGSIZE;
     }
 
-    /* Even broadcasts can have specific priorities from the payload */
-    uint8_t priority = get_priority_from_pb(payload, len);
-
-    fill_isotp_fixed_id(&tx_addr, priority, FIXED_TATYPE_FUNCTIONAL,
-                        BROADCAST_NODE, local);
-
-    k_mutex_lock(&send_lock, K_FOREVER);
-    ret = isotp_send(&broadcast_send_ctx, can_dev, payload, len, &tx_addr, 
-                     &link_addr_cfg.rx_fc_addr, NULL, NULL);
-    k_mutex_unlock(&send_lock);
-
-    return ret;
+    return start_async_send(BROADCAST_NODE, true, payload, len);
 }

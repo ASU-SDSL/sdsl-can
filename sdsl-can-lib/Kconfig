@@ -1,0 +1,33 @@
+menuconfig SDSL_CAN
+    bool "SDSL CAN library"
+    select CAN
+    select ISOTP
+    select NANOPB
+    help
+      Enable the SDSL CAN link library.
+
+if SDSL_CAN
+
+config CAN_LINK_NODE_ADDR
+    hex "Local CAN node address"
+    default 0x02
+    range 0x01 0xFE
+
+config CAN_LINK_PEER_NODE_ADDR
+    hex "Peer CAN node address"
+    default 0x01
+    range 0x01 0xFE
+
+config CAN_LINK_LOOPBACK
+    bool "Enable CAN loopback mode"
+    default n
+
+config CAN_LINK_DISABLE_UNICAST_RX
+    bool "Disable unicast RX worker"
+    default n
+
+config CAN_LINK_DISABLE_BROADCAST_RX
+    bool "Disable broadcast RX worker"
+    default n
+
+endif

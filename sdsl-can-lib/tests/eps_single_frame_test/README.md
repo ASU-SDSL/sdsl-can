@@ -33,22 +33,23 @@ Behavior:
 
 ## Build And Flash
 
-Build and flash board A:
+From the workspace root (`SDSL-CAN`), build and flash board A:
 
 ```powershell
-west build -p always -b nucleo_f103rb .\sdsl-can-lib\tests\eps_single_frame_test -- "-DCONF_FILE=prj.conf;node_a.conf"
+west build -p always -b nucleo_f103rb sdsl-can-lib\tests\eps_single_frame_test -- "-DCONF_FILE=prj.conf;node_a.conf"
 west flash
 ```
 
 Build and flash board B:
 
 ```powershell
-west build -p always -b nucleo_f103rb .\sdsl-can-lib\tests\eps_single_frame_test -- "-DCONF_FILE=prj.conf;node_b.conf"
+west build -p always -b nucleo_f103rb sdsl-can-lib\tests\eps_single_frame_test -- "-DCONF_FILE=prj.conf;node_b.conf"
 west flash
 ```
 
 Note:
 
+- if you are switching from an older layout, remove the workspace-root `build/` directory first
 - keep `"-DCONF_FILE=prj.conf;node_a.conf"` and `"-DCONF_FILE=prj.conf;node_b.conf"` quoted in PowerShell
 - board A and board B must share CAN ground and CANH/CANL
 
