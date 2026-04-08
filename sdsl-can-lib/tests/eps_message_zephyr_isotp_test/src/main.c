@@ -12,52 +12,33 @@
 #include "can_link.h"
 #include "link.pb.h"
 
-LOG_MODULE_REGISTER(eps, LOG_LEVEL_INF);
+LOG_MODULE_REGISTER(eps_zephyr_isotp, LOG_LEVEL_INF);
 
-/* Fallback for sleep period if Kconfig is missing */
 #ifndef CONFIG_CAN_LINK_TX_PERIOD_MS
 #define CONFIG_CAN_LINK_TX_PERIOD_MS 1000
 #endif
 
-/* Fallback for peer node if Kconfig is missing */
 #ifndef CONFIG_CAN_LINK_PEER_NODE_ADDR
 #define CONFIG_CAN_LINK_PEER_NODE_ADDR 0x02
 #endif
 
-/**
- * @brief Mirror of LinkMessage logic for planning transmissions.
- */
 struct tx_action {
     bool broadcast;
     uint8_t target_node;
-    uint8_t priority; 
+    uint8_t priority;
 };
 
-/**
- * @brief Unified encoding function. 
- * BUG FIX: Combined encode_unicast and encode_broadcast into one to 
- * match the signature used in main() and fix the 'action' variable scope error.
- */
-static bool encode_message(uint32_t seq, const struct tx_action *action, uint8_t *buffer, size_t *encoded_len)
+static bool encode_message(uint32_t seq, const struct tx_action *action, uint8_t *buffer,
+               size_t *encoded_len)
 {
     LinkMessage msg = LinkMessage_init_zero;
     pb_ostream_t stream = pb_ostream_from_buffer(buffer, LinkMessage_size);
 
-    /* Fill Header/Routing Info */
     msg.node_id = can_link_node_id();
     msg.target_node = action->broadcast ? 0xFF : action->target_node;
     msg.priority = action->priority;
     msg.seq = seq;
     msg.uptime_ms = k_uptime_get_32();
-
-    /*
-     * Keep the test payload firmly in the multi-frame range.
-     *
-     * In proto3, zero-valued scalar fields are omitted from the wire encoding.
-     * If we allow fields like seq=0 or type=HEARTBEAT(0), early messages can
-     * shrink into a single-frame payload. Using a non-default enum value here
-     * keeps the encoded message length above the single-frame ISO-TP limit.
-     */
     msg.type = LinkMessage_MsgType_STATUS;
 
     if (!pb_encode(&stream, LinkMessage_fields, &msg)) {
@@ -82,11 +63,8 @@ static bool decode_message(const uint8_t *buffer, size_t len, LinkMessage *msg)
     return true;
 }
 
-/**
- * @brief Callback triggered by the can_link RX threads.
- */
 static void on_can_message(const uint8_t *buffer, size_t len, uint8_t source_node, bool is_broadcast,
-                           void *user_data)
+               void *user_data)
 {
     LinkMessage msg;
     ARG_UNUSED(user_data);
@@ -95,15 +73,11 @@ static void on_can_message(const uint8_t *buffer, size_t len, uint8_t source_nod
         return;
     }
 
-    /* Source node passed from can_link should match msg.node_id */
     LOG_INF("RX [Prio:%u] src:%u->dst:%u type:%u seq:%" PRIu32 " (BC:%d)",
-            (unsigned int)msg.priority, source_node, (unsigned int)msg.target_node, 
-            (unsigned int)msg.type, msg.seq, is_broadcast);
+        (unsigned int)msg.priority, source_node, (unsigned int)msg.target_node,
+        (unsigned int)msg.type, msg.seq, is_broadcast);
 }
 
-/**
- * @brief Builds a plan that tests different priorities and targets.
- */
 static size_t build_tx_plan(uint8_t local_node, struct tx_action *plan, size_t max_actions)
 {
     ARG_UNUSED(local_node);
@@ -112,13 +86,12 @@ static size_t build_tx_plan(uint8_t local_node, struct tx_action *plan, size_t m
         return 0U;
     }
 
-    /*
-     * Keep the two-board integration test on priority 0 so the current
-     * can_link RX bind matches the incoming unicast frames.
-     */
-    plan[0] = (struct tx_action){ .broadcast = false,
-                                  .target_node = (uint8_t)CONFIG_CAN_LINK_PEER_NODE_ADDR,
-                                  .priority = 0 };
+    plan[0] = (struct tx_action){
+        .broadcast = false,
+        .target_node = (uint8_t)CONFIG_CAN_LINK_PEER_NODE_ADDR,
+        .priority = 0,
+    };
+
     return 1U;
 }
 
@@ -126,27 +99,27 @@ int main(void)
 {
     uint8_t tx_buffer[LinkMessage_size];
     struct tx_action tx_plan[3];
-    /* Start at 1 so the first transmitted protobuf also stays multi-frame. */
     uint32_t seq = 1U;
-    size_t plan_len, plan_idx = 0U;
+    size_t plan_len;
+    size_t plan_idx = 0U;
     int ret;
+    uint8_t local_node;
 
-    /* Initialize the link with our decoder callback */
     ret = can_link_init(on_can_message, NULL);
     if (ret != 0) {
         LOG_ERR("CAN init failed: %d", ret);
         return 0;
     }
 
-    uint8_t local_node = (uint8_t)can_link_node_id();
+    local_node = (uint8_t)can_link_node_id();
     plan_len = build_tx_plan(local_node, tx_plan, ARRAY_SIZE(tx_plan));
 
-    LOG_INF("Satellite Link Node %u online. TX Period: %dms",
-            (unsigned int)local_node, CONFIG_CAN_LINK_TX_PERIOD_MS);
+    LOG_INF("Zephyr ISO-TP session test node %u online. TX Period: %dms",
+        (unsigned int)local_node, CONFIG_CAN_LINK_TX_PERIOD_MS);
 
     if (local_node != 0x01U) {
-        LOG_INF("Node %u configured as RX-only peer for two-board test",
-                (unsigned int)local_node);
+        LOG_INF("Node %u configured as RX-only peer for Zephyr ISO-TP session test",
+            (unsigned int)local_node);
 
         while (1) {
             k_msleep(CONFIG_CAN_LINK_TX_PERIOD_MS);
@@ -169,11 +142,11 @@ int main(void)
         }
 
         if (ret != 0) {
-            LOG_ERR("TX failed (seq %u): %d", (unsigned int)seq, ret);
+            LOG_ERR("TX start failed (seq %u): %d", (unsigned int)seq, ret);
         } else {
-            LOG_INF("TX sent: target=%u prio=%u len=%u seq=%u",
-                    (unsigned int)action->target_node, (unsigned int)action->priority,
-                    (unsigned int)encoded_len, (unsigned int)seq);
+            LOG_INF("TX started: target=%u prio=%u len=%u seq=%u",
+                (unsigned int)action->target_node, (unsigned int)action->priority,
+                (unsigned int)encoded_len, (unsigned int)seq);
         }
 
         seq++;

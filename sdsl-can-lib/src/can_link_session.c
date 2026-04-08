@@ -1,5 +1,5 @@
 /*
- * can_link.c
+ * can_link_session.c
  *
  * Zephyr-native ISO-TP wrapper that keeps transport ownership inside Zephyr's
  * isotp_bind()/isotp_recv()/isotp_send() state machines.
@@ -224,52 +224,24 @@ static struct rx_worker broadcast_worker = {
     .is_broadcast = true,
 };
 
-/*
- * Return the local node ID currently configured for this link instance.
- */
 uint32_t can_link_node_id(void)
 {
     /* Expose the locally configured node ID without leaking internal config state. */
     return (uint32_t)link_cfg.node_id;
 }
 
-/*
- * Build one extended CAN identifier from a traffic-class base plus node IDs.
- *
- * @param base_id Fixed high bits that identify the traffic class.
- * @param target Destination node encoded into bits 15:8.
- * @param source Source node encoded into bits 7:0.
- *
- * @return Fully packed 29-bit CAN identifier.
- */
 static uint32_t build_can_id(uint32_t base_id, uint8_t target, uint8_t source)
 {
     /* Pack the routing tuple into the 29-bit extended CAN ID. */
     return base_id | ((uint32_t)target << 8) | (uint32_t)source;
 }
 
-/*
- * Recover the source node ID from the receive context's matched CAN ID.
- *
- * @param ctx Receive context that holds the bound RX address.
- *
- * @return Source node carried in the low byte of the extended CAN ID.
- */
 static uint8_t extract_source_node(const struct isotp_recv_ctx *ctx)
 {
     /* RX contexts keep the matched CAN ID, so the source node lives in the low byte. */
     return (uint8_t)(ctx->rx_addr.ext_id & 0xFFU);
 }
 
-/*
- * Populate one Zephyr ISO-TP message identifier from routing components.
- *
- * @param msg_id Output message-ID structure to populate.
- * @param base_id Fixed CAN-ID base that selects the traffic class.
- * @param target Destination node encoded into the CAN ID.
- * @param source Source node encoded into the CAN ID.
- * @param ext_addr Extended-address byte used as the secondary transport selector.
- */
 static void fill_isotp_ext_id(struct isotp_msg_id *msg_id, uint32_t base_id, uint8_t target,
                   uint8_t source, uint8_t ext_addr)
 {
@@ -281,17 +253,6 @@ static void fill_isotp_ext_id(struct isotp_msg_id *msg_id, uint32_t base_id, uin
     };
 }
 
-/*
- * Precompute the complete set of ISO-TP identifiers used by this node.
- *
- * This builds the long-lived unicast and broadcast routes once during init so
- * the RX workers and send paths can reuse a consistent address map derived
- * from the local node ID, configured peer ID, and loopback mode.
- *
- * @param ids Output structure that receives the fully populated ISO-TP
- *            identifiers for unicast TX/RX, flow-control routing, and
- *            broadcast traffic.
- */
 static void configure_isotp_ids(struct isotp_ids *ids)
 {
     const uint8_t local = link_cfg.node_id;
@@ -321,12 +282,6 @@ static void configure_isotp_ids(struct isotp_ids *ids)
               local, CAN_LINK_EXT_ADDR_FC);
 }
 
-/*
- * Completion callback invoked by Zephyr when an async ISO-TP send finishes.
- *
- * @param error_nr Zephyr ISO-TP completion status.
- * @param arg Caller-supplied pointer to the shared async TX state.
- */
 static void tx_complete_cb(int error_nr, void *arg)
 {
     struct async_tx_state *state = arg;
@@ -346,13 +301,6 @@ static void tx_complete_cb(int error_nr, void *arg)
     }
 }
 
-/*
- * Long-lived worker thread that binds one RX route and drains completed payloads.
- *
- * @param arg1 Pointer to the worker configuration for this RX path.
- * @param arg2 Unused Zephyr thread argument.
- * @param arg3 Unused Zephyr thread argument.
- */
 static void rx_thread(void *arg1, void *arg2, void *arg3)
 {
     uint8_t rx_buffer[LIB_RX_BUFFER_SIZE];
@@ -400,14 +348,6 @@ static void rx_thread(void *arg1, void *arg2, void *arg3)
     }
 }
 
-/*
- * Decode the protobuf payload just far enough to recover the requested priority.
- *
- * @param payload Serialized LinkMessage bytes.
- * @param len Payload length in bytes.
- *
- * @return CAN priority in the range 0..7, or the library default on decode failure.
- */
 static uint8_t get_priority_from_pb(const uint8_t *payload, size_t len)
 {
     LinkMessage msg = LinkMessage_init_zero;
@@ -422,16 +362,6 @@ static uint8_t get_priority_from_pb(const uint8_t *payload, size_t len)
     return (msg.priority > 7U) ? 7U : (uint8_t)msg.priority;
 }
 
-/*
- * Launch one asynchronous unicast or broadcast ISO-TP transfer.
- *
- * @param target_node Logical destination node, or BROADCAST_NODE for functional traffic.
- * @param is_broadcast True when the send should use the broadcast route.
- * @param payload Caller-provided serialized bytes to transmit.
- * @param len Payload length in bytes.
- *
- * @return 0 on successful start, or a negative error if the transfer could not be queued.
- */
 static int start_async_send(uint8_t target_node, bool is_broadcast, const uint8_t *payload, size_t len)
 {
     uint8_t priority;
@@ -490,14 +420,6 @@ static int start_async_send(uint8_t target_node, bool is_broadcast, const uint8_
     return ret;
 }
 
-/*
- * Initialize the CAN controller, transport address map, and background RX workers.
- *
- * @param rx_handler Application callback invoked for completed inbound payloads.
- * @param user_data Opaque pointer passed back to rx_handler.
- *
- * @return 0 on success, or a negative error if initialization fails.
- */
 int can_link_init(can_link_rx_handler_t rx_handler, void *user_data)
 {
     k_tid_t rx_tid;
@@ -572,28 +494,11 @@ int can_link_init(can_link_rx_handler_t rx_handler, void *user_data)
     return 0;
 }
 
-/*
- * Send a payload to the configured default peer node.
- *
- * @param payload Serialized bytes to transmit.
- * @param len Payload length in bytes.
- *
- * @return Result from can_link_send_to().
- */
 int can_link_send(const uint8_t *payload, size_t len)
 {
     return can_link_send_to(link_cfg.peer_id, payload, len);
 }
 
-/*
- * Start an asynchronous point-to-point ISO-TP transfer to one target node.
- *
- * @param target_node Destination node ID.
- * @param payload Serialized bytes to transmit.
- * @param len Payload length in bytes.
- *
- * @return 0 on successful start, or a negative error if validation or queueing fails.
- */
 int can_link_send_to(uint8_t target_node, const uint8_t *payload, size_t len)
 {
     if (!is_initialized) {
@@ -611,14 +516,6 @@ int can_link_send_to(uint8_t target_node, const uint8_t *payload, size_t len)
     return start_async_send(target_node, false, payload, len);
 }
 
-/*
- * Start an asynchronous functional broadcast send on the single-frame path.
- *
- * @param payload Serialized bytes to transmit.
- * @param len Payload length in bytes.
- *
- * @return 0 on successful start, or a negative error if validation or queueing fails.
- */
 int can_link_send_broadcast(const uint8_t *payload, size_t len)
 {
     if (!is_initialized) {

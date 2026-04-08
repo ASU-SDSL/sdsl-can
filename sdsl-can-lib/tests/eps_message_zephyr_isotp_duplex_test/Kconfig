@@ -1,0 +1,17 @@
+mainmenu "EPS Message Zephyr ISO-TP Duplex Test"
+
+source "Kconfig.zephyr"
+
+menu "EPS message Zephyr ISO-TP duplex test options"
+
+config CAN_LINK_TX_PERIOD_MS
+    int "TX period in milliseconds"
+    default 1500
+    range 10 60000
+
+config CAN_LINK_TX_START_OFFSET_MS
+    int "Additional TX start offset in milliseconds"
+    default 0
+    range 0 60000
+
+endmenu

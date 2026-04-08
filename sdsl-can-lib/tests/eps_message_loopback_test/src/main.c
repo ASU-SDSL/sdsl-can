@@ -48,14 +48,27 @@ static bool encode_message(uint32_t seq, const struct tx_action *action, uint8_t
     msg.node_id = can_link_node_id();
     msg.target_node = action->broadcast ? 0xFF : action->target_node;
     msg.priority = action->priority;
-    msg.seq = seq;
-    msg.uptime_ms = k_uptime_get_32();
+    /*
+     * The session-backed can_link implementation keeps broadcast on the
+     * single-frame path, so keep those payloads compact. Unicast messages
+     * still carry the richer fields needed for multi-frame coverage.
+     */
+    if (!action->broadcast) {
+        msg.seq = seq;
+        msg.uptime_ms = k_uptime_get_32();
 
-    /* Logic to toggle message type based on sequence */
-    msg.type = (seq % 2U == 0U) ? LinkMessage_MsgType_HEARTBEAT : LinkMessage_MsgType_STATUS;
+        /* Logic to toggle message type based on sequence */
+        msg.type = (seq % 2U == 0U) ? LinkMessage_MsgType_HEARTBEAT : LinkMessage_MsgType_STATUS;
+    }
 
     if (!pb_encode(&stream, LinkMessage_fields, &msg)) {
         LOG_ERR("Nanopb encode failed: %s", PB_GET_ERROR(&stream));
+        return false;
+    }
+
+    if (action->broadcast && (stream.bytes_written > 6U)) {
+        LOG_ERR("Broadcast payload too large for session-backed single-frame path: %u",
+                (unsigned int)stream.bytes_written);
         return false;
     }
 
@@ -155,7 +168,7 @@ int main(void)
             continue;
         }
 
-        /* 2. Send via can_link (APIs now auto-extract priority from the buffer) */
+        /* 2. Send through the public can_link API using the session-backed transport. */
         if (action->broadcast) {
             ret = can_link_send_broadcast(tx_buffer, encoded_len);
         } else {
@@ -176,4 +189,3 @@ int main(void)
         k_msleep(CONFIG_CAN_LINK_TX_PERIOD_MS);
     }
 }
-

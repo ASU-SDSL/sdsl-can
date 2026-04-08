@@ -1,0 +1,12 @@
+mainmenu "EPS Message Zephyr ISO-TP Test"
+
+source "Kconfig.zephyr"
+
+menu "EPS message Zephyr ISO-TP test options"
+
+config CAN_LINK_TX_PERIOD_MS
+    int "TX period in milliseconds"
+    default 1000
+    range 10 60000
+
+endmenu
