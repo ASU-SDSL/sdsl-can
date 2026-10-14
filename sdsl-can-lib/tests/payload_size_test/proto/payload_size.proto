@@ -1,0 +1,14 @@
+syntax = "proto3";
+import "nanopb.proto";
+
+// Keep fields 1..6 wire-compatible with LinkMessage, which can_link inspects.
+// This test-only message does not change the production schema.
+message PayloadSizeMessage {
+    uint32 priority = 1;
+    uint32 node_id = 2;
+    uint32 seq = 3;
+    uint32 uptime_ms = 4;
+    uint32 type = 5;
+    uint32 target_node = 6;
+    bytes pattern = 7 [(nanopb).max_size = 128];
+}

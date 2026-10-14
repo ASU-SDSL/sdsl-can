@@ -1,0 +1,11 @@
+mainmenu "CAN payload size test"
+source "Kconfig.zephyr"
+
+config PAYLOAD_SIZE_DUPLEX
+    bool "Transmit from both nodes"
+    default n
+
+config PAYLOAD_SIZE_PERIOD_MS
+    int "Transmit interval in milliseconds"
+    default 100
+    range 100 5000
